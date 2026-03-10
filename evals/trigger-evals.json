@@ -1,0 +1,26 @@
+[
+  {
+    "query": "Set up a human-in-the-loop analysis pipeline for this project with quick exploratory runs first and more reproducible stages later.",
+    "should_trigger": true
+  },
+  {
+    "query": "Run the next stale DVC stage, then review the outputs and tell me if they are ready for approval.",
+    "should_trigger": true
+  },
+  {
+    "query": "I want to compare several parameter settings systematically and keep a comparison table for the runs.",
+    "should_trigger": true
+  },
+  {
+    "query": "Explain whether we should use marimo, Hamilton conventions, Hydra, and DVC for this analytic workflow.",
+    "should_trigger": true
+  },
+  {
+    "query": "Create a Word document memo with a title page and table of contents.",
+    "should_trigger": false
+  },
+  {
+    "query": "Help me scrape a website and save the results to CSV.",
+    "should_trigger": false
+  }
+]
