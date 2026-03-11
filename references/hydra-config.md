@@ -71,6 +71,28 @@ Switch source at the command line:
 python scripts/run.py source=splunk
 ```
 
+Key composition rules:
+
+- `defaults:` is composition metadata, not business data you usually read from `cfg`
+- `_self_` means "merge the body of the current file here"
+- order matters: later merges win on conflicts
+- group selections like `source: splunk` usually land under `cfg.source`
+- `# @package _global_` changes placement so the file merges at the config root
+
+Minimal precedence example:
+
+```yaml
+defaults:
+  - source: csv_local
+  - _self_
+
+source:
+  timeout: 30
+```
+
+In this case, the current file merges after `source: csv_local`, so `source.timeout: 30`
+from the current file overrides the same field from `csv_local.yaml`.
+
 ---
 
 ## 3. Experiment Configs {#experiment-configs}
@@ -129,6 +151,24 @@ python scripts/run.py source.earliest="-6mon"
 python scripts/run.py baseline.resample_freq=30min analysis.anomaly_threshold=2.5
 ```
 
+Operator semantics:
+
+- `key=value`: set an existing key; usually errors if the path does not exist
+- `+key=value`: add a new key only if it is currently absent; errors if already present
+- `++key=value`: create or replace; use carefully because it can hide typos
+- `~key`: delete a key or remove a defaults-list selection
+
+Two different kinds of override:
+
+- `source=splunk` selects a config-group option, meaning Hydra loads a different config file
+- `source.timeout=60` changes a field inside the already selected `source` subtree
+
+Practical rule:
+
+- use plain `key=value` by default
+- use `+` when "must be new" is the point
+- use `++` only when you explicitly want create-or-replace behavior
+
 ---
 
 ## 5. Multirun Sweeps {#multirun}
@@ -186,6 +226,13 @@ Every run should save:
 The comparison table builder reads `metrics.json` from every run directory
 to build the cross-run comparison table.
 
+Important runtime detail:
+
+- Hydra always creates a run directory and writes `.hydra/` metadata there
+- with Hydra 1.2+ and `version_base=None`, `hydra.job.chdir` defaults to `False`
+- do not assume `Path(".")` is the run directory unless you explicitly enable `hydra.job.chdir=True`
+- prefer `HydraConfig.get().runtime.output_dir` when writing run artifacts
+
 ---
 
 ## 7. Integration with the Workbench {#integration}
@@ -206,14 +253,16 @@ Combine Hydra with either:
 ```python
 # scripts/run.py
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 import json
 from pathlib import Path
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    # Hydra changes cwd to the output directory automatically
-    out = Path(".")
+    out = Path(HydraConfig.get().runtime.output_dir)
+    (out / "figures").mkdir(parents=True, exist_ok=True)
+    (out / "data").mkdir(parents=True, exist_ok=True)
 
     # Import and call Hamilton-compatible modules directly
     from modules.baseline import incidents_hourly, baseline_summary
@@ -232,7 +281,6 @@ def main(cfg: DictConfig) -> None:
     summary = baseline_summary(ts, ...)
 
     # Save artifacts
-    (out / "figures").mkdir(exist_ok=True)
     json.dump(summary, open(out / "metrics.json", "w"), indent=2)
     ts.to_csv(out / "data" / "timeseries.csv")
 
