@@ -3,13 +3,18 @@
 ## Table of Contents
 1. [What It Is](#what-it-is)
 2. [Mental Model](#mental-model)
-3. [Canonical Pattern](#canonical-pattern)
-4. [Authoring Conventions](#authoring-conventions)
-5. [Decision Rules](#decision-rules)
-6. [Advanced Features](#advanced-features)
-7. [Decorators That Change Behavior](#decorators)
-8. [Sharp Edges](#sharp-edges)
-9. [When to Read Primary Docs](#when-to-read-primary-docs)
+3. [Install And Extras](#install-and-extras)
+4. [Canonical Pattern](#canonical-pattern)
+5. [Driver And Builder](#driver-and-builder)
+6. [How Hamilton Builds The DAG](#how-hamilton-builds-the-dag)
+7. [Function Modifiers That Matter](#function-modifiers-that-matter)
+8. [Materialization And Adapters](#materialization-and-adapters)
+9. [Caching And Parallelism](#caching-and-parallelism)
+10. [Visualization, UI, And CLI](#visualization-ui-and-cli)
+11. [Project Structure And Testing](#project-structure-and-testing)
+12. [Decision Rules](#decision-rules)
+13. [Common Mistakes](#common-mistakes)
+14. [When To Read Primary Docs](#when-to-read-primary-docs)
 
 ---
 
@@ -17,30 +22,37 @@
 
 Hamilton is a Python dataflow framework where:
 
-- function names define node names
+- a function becomes a node
 - parameter names define dependencies
 - type hints define expected contracts
-- the driver builds and executes the resulting DAG
+- the runtime builds and executes the DAG automatically
 
-Use it for transformation logic, dependency visibility, selective execution,
-validation, and optional caching/materialization.
+It is best understood as the transformation/computation layer inside a larger
+system. Keep scheduling, infrastructure orchestration, and deployment concerns
+outside Hamilton.
 
-Hamilton is **not** a scheduler, infrastructure orchestrator, or deployment
-platform. Keep orchestration outside Hamilton.
+Good fit:
 
-For this workbench, Hamilton is a good fit when the dependency graph itself
-helps compare, review, or selectively execute analysis outputs.
+- analytics, data, ML, and LLM workflows with meaningful intermediate artifacts
+- codebases that need lineage, selective execution, validation, and portability
+- teams willing to use naming discipline and many small functions
+
+Bad fit:
+
+- workflows dominated by opaque large steps
+- teams mainly looking for scheduling or cluster management
+- low-code / visual-only pipeline authoring preferences
 
 ---
 
 ## 2. Mental Model {#mental-model}
 
-The core idea is simple:
+Hamilton's authoring model is intentionally small:
 
-- a function declares how to compute one artifact
-- its parameters name the upstream artifacts it needs
-- Hamilton matches names to build the DAG
-- runtime inputs can satisfy dependencies that are not defined as functions
+- function name = node name
+- parameter names = dependency names
+- type hints = interface contract
+- helper functions prefixed with `_` are ignored by graph discovery
 
 Example:
 
@@ -52,23 +64,43 @@ def spend_mean(spend):
 This does **not** call `spend`. It declares that `spend_mean` depends on a node
 or runtime input named `spend`.
 
-Important implications:
+Important consequences:
 
-- name outputs like artifacts, not actions
-- prefer many small functions over one long pipeline function
-- a missing dependency is fine if you plan to provide it in `inputs=...`
-- helper functions prefixed with `_` are ignored by Hamilton graph discovery
+- node names are the public API of the DAG
+- small output-oriented functions work better than giant stage functions
+- missing upstreams are fine if they will be provided through `inputs=...`
+- many decorators reshape graph construction, not just runtime behavior
 
-Think of Hamilton as separating:
+Think in two layers:
 
-- **dataflow definition**: plain Python functions in modules
-- **runtime behavior**: the Driver, Builder, adapters, executors, materializers, cache
+- **definition layer**: plain Python functions in modules
+- **runtime layer**: `Driver`, `Builder`, executors, adapters, materializers, cache
 
-That separation is the main reason Hamilton stays readable.
+That separation is why Hamilton remains readable.
 
 ---
 
-## 3. Canonical Pattern {#canonical-pattern}
+## 3. Install And Extras {#install-and-extras}
+
+The package name is `sf-hamilton`.
+
+Common installs:
+
+```bash
+pip install sf-hamilton
+pip install "sf-hamilton[visualization]"
+pip install "sf-hamilton[ui,sdk]"
+```
+
+Notes:
+
+- visualization also needs Graphviz installed on the machine
+- validation/UI/integration features may require extras such as Pandera, Pydantic, Ray, or Dask
+- install details and supported extras are version-sensitive; re-check official docs when wiring a new integration
+
+---
+
+## 4. Canonical Pattern {#canonical-pattern}
 
 ### Transformation module
 
@@ -91,10 +123,6 @@ def spend_mean(spend: pd.Series) -> float:
 
 def spend_zero_mean(spend: pd.Series, spend_mean: float) -> pd.Series:
     return spend - spend_mean
-
-
-def _round2(x: float) -> float:
-    return round(x, 2)
 ```
 
 ### Runtime entry point
@@ -122,126 +150,159 @@ result = dr.execute(
 )
 ```
 
-What this demonstrates:
+What this shows:
 
-- `_round2` is ignored because of the leading underscore
-- `spend` and `signups` are runtime inputs, not Hamilton functions
-- `Builder().with_modules(...).build()` is the normal assembly pattern
-- `execute([...], inputs=...)` asks Hamilton to compute only the requested outputs
-
----
-
-## 4. Authoring Conventions {#authoring-conventions}
-
-Write Hamilton-friendly modules as collections of small, output-oriented,
-mostly side-effect-free functions.
-
-Recommended:
-
-- one function = one meaningful artifact
-- function names read like outputs
-- type hints on all public node functions
-- pure transformations in modules
-- thin runtime scripts that assemble `Builder`
-
-Avoid:
-
-- mutating shared global state
-- burying disk/network I/O in core transformation functions
-- giant "do everything" functions
-- ambiguous node names like `process_data` or `run_step`
-
-Use a leading underscore for local helpers that should not become DAG nodes.
-
-This style is useful even without Hamilton runtime because it lowers edit blast
-radius, improves testability, and keeps dependency structure visible.
+- transformation code stays in plain modules
+- runtime inputs satisfy missing upstreams
+- `Builder()` assembles runtime behavior
+- `execute()` computes only the subgraph needed for requested outputs
 
 ---
 
-## 5. Decision Rules {#decision-rules}
+## 5. Driver And Builder {#driver-and-builder}
 
-### Plain functions vs Hamilton runtime
+### `Driver`
 
-Stay with plain imports when:
+`Driver` is the runtime object you execute. It is responsible for:
 
-- the module graph is still changing rapidly
-- script order is obvious and selective execution is not useful
-- graph visualization would not change decisions
+- building the graph
+- validating it
+- executing the requested slice
+- returning results
+- exposing visualization and materialization operations
 
-Add Hamilton runtime when:
+Important methods to remember:
 
-- you want to request specific outputs and run only their dependencies
-- the graph itself helps reasoning or review
-- multiple entry points should reuse the same transformation modules
-- node-level caching or validation would save real time
+- `execute(...)`
+- `materialize(...)`
+- visualization / graph inspection helpers
 
-### Runtime inputs vs I/O in the graph
+### `Builder`
 
-Use runtime inputs when:
+`Builder` is the fluent runtime assembly surface. Use it to keep runtime choices
+out of DAG modules.
 
-- prototyping
-- unit testing
-- the caller should control data loading
-- storage paths/systems vary by environment
+Key methods:
 
-Use materializers when:
+- `with_modules(...)`
+- `with_config(...)`
+- `with_adapters(...)`
+- `with_materializers(...)`
+- `with_cache(...)`
+- `enable_dynamic_execution(...)`
 
-- deployment code should decide what gets loaded/saved
-- you want loader/saver nodes to be explicit and reusable
-- the graph should include storage edges without baking them into business logic
+Common patterns:
 
-Use decorator-based I/O when:
+```python
+dr = driver.Builder().with_modules(features, training).build()
+```
 
-- loading/saving behavior is part of the dataflow contract itself
-- you want those edges expressed directly on the node definition
+```python
+dr = (
+    driver.Builder()
+    .with_modules(training)
+    .with_config({"model_type": "xgboost", "environment": "prod"})
+    .build()
+)
+```
 
-Default recommendation:
-
-- start with runtime inputs
-- move to materializers once I/O contracts stabilize
-- use decorator-based I/O only when explicit graph-level storage behavior is valuable
-
-### Caching
-
-Use caching when:
-
-- intermediate nodes are expensive
-- graph structure is stable enough that cache reuse matters
-
-Avoid heavy reliance on caching when:
-
-- upstream data changes constantly
-- nodes depend on hidden helper behavior or unstable external libraries
+```python
+dr = (
+    driver.Builder()
+    .with_modules(pipeline)
+    .with_cache()
+    .with_adapters(tracker)
+    .build()
+)
+```
 
 Practical rule:
 
-- start without cache
-- add it after correctness and graph shape are stable
-- recompute or disable cache for external source loaders
-
-### Parallel execution
-
-Use adapter/executor-based parallelism when:
-
-- work is I/O-bound or executor-backed parallelism is enough
-- you do not want to change node signatures much
-
-Use dynamic execution with `Parallelizable[]` and `Collect[]` when:
-
-- the graph genuinely contains fan-out/fan-in work
-- per-item parallel subgraphs are part of the logical model
-
-Do not enable dynamic execution by default. It is a structural choice, not a speed flag.
+- DAG logic belongs in modules
+- environment/runtime choices belong in the Builder assembly layer
 
 ---
 
-## 6. Advanced Features {#advanced-features}
+## 6. How Hamilton Builds The DAG {#how-hamilton-builds-the-dag}
 
-### Config-driven variants
+At a high level Hamilton:
 
-Use `Builder.with_config({...})` together with `@config.when(...)` family
-decorators when the graph should swap implementations by mode, environment, or
-experiment choice.
+1. scans the provided modules for Hamilton functions
+2. creates nodes from those functions
+3. resolves decorators / function modifiers
+4. connects dependencies by parameter name
+5. validates graph structure and types
+6. executes only the subgraph needed for requested outputs
+
+This explains three important properties:
+
+- you can adopt Hamilton incrementally
+- the framework computes only what is required
+- decorators matter because they can alter graph shape before execution
+
+---
+
+## 7. Function Modifiers That Matter {#function-modifiers-that-matter}
+
+Function modifiers are central to Hamilton. They do more than ordinary Python
+decorators: they can change inclusion, expand nodes, split outputs, inject I/O,
+add validation, or attach metadata.
+
+### `@tag`
+
+Use for metadata such as ownership, domain, data product, or policy.
+
+```python
+from hamilton.function_modifiers import tag
+
+@tag(owner="growth", data_product="marketing", pii="false")
+def weekly_revenue(clean_df):
+    ...
+```
+
+### `@check_output`
+
+Use for validation without mixing checks into business logic.
+
+```python
+from hamilton.function_modifiers import check_output
+
+@check_output(range=(0.0, 1.0), importance="fail")
+def churn_probability(raw_score):
+    return raw_score.clip(0.0, 1.0)
+```
+
+### `@extract_columns` / `@extract_fields`
+
+Use when a composite output should expose downstream-addressable pieces.
+
+```python
+from hamilton.function_modifiers import extract_columns
+
+@extract_columns("user_id", "country", "revenue")
+def clean_df(raw_df):
+    return raw_df.dropna()
+```
+
+### `@parameterize`
+
+Use when one implementation should generate many named nodes.
+
+```python
+from hamilton.function_modifiers import parameterize, source, value
+
+@parameterize(
+    revenue_by_country=dict(df=source("orders"), groupby_col=value("country")),
+    revenue_by_segment=dict(df=source("orders"), groupby_col=value("segment")),
+)
+def revenue_by_dimension(df, groupby_col):
+    return df.groupby(groupby_col)["revenue"].sum()
+```
+
+### `@config.when(...)` family
+
+Use config-based inclusion when different implementations should resolve to the
+same logical node name.
 
 ```python
 from hamilton.function_modifiers import config
@@ -255,64 +316,104 @@ def base_model__default():
     ...
 ```
 
+### `@load_from` / `@save_to`
+
+Use when storage behavior should be explicit in the DAG.
+
 ```python
-dr = (
-    driver.Builder()
-    .with_modules(training)
-    .with_config({"model_type": "xgboost"})
-    .build()
-)
+from hamilton.function_modifiers import load_from, save_to, source
+
+@load_from.csv(path=source("raw_input_path"))
+def cleaned_data(raw_data):
+    return raw_data.dropna()
+
+@save_to.parquet(path=source("output_path"), output_name_="cleaned_data_written")
+def cleaned_data_for_save(cleaned_data):
+    return cleaned_data
 ```
 
-Decision rule:
+Practical interpretation:
 
-- use this to swap node implementations cleanly
-- do not scatter environment branching across runner code if the difference is really a graph choice
+- inclusion decorators decide which nodes exist
+- parameterization expands one function into many nodes
+- extraction exposes column/field lineage
+- I/O decorators inject storage edges
+- validation decorators attach checks after computation
+- metadata decorators help governance and filtering without changing computation
 
-### Materializers
+---
 
-Hamilton supports two operational patterns:
+## 8. Materialization And Adapters {#materialization-and-adapters}
 
-- static materializers via `Builder.with_materializers(...)`
-- dynamic materialization via `Driver.materialize(...)`
+### Materialization
 
-Static materializers are usually the better default because load/save nodes
-become part of the graph and can be visualized or requested by name.
+There are two main styles:
+
+- static materializers attached at build time via `with_materializers(...)`
+- dynamic materializers passed to `Driver.materialize(...)`
+
+Dynamic materialization example:
 
 ```python
+from hamilton import base, driver
 from hamilton.io.materialization import from_, to
+import pipeline
 
-dr = (
-    driver.Builder()
-    .with_modules(pipeline)
-    .with_materializers(
-        from_.csv(target="raw_df", path="./input.csv"),
-        to.csv(id="feature_export", dependencies=["feature_a"], path="./out/features.csv"),
-    )
-    .build()
-)
-```
+dr = driver.Builder().with_modules(pipeline).build()
 
-Dynamic materialization is useful when the caller should decide load/save
-behavior at execution time:
-
-```python
 metadata, outputs = dr.materialize(
     from_.csv(target="raw_df", path="./input.csv"),
-    to.csv(id="feature_export", dependencies=["feature_a"], path="./out/features.csv"),
-    additional_vars=["feature_a"],
+    to.csv(
+        id="feature_export",
+        dependencies=["feature_a", "feature_b"],
+        path="./out/features.csv",
+        combine=base.PandasDataFrameResult(),
+    ),
+    additional_vars=["feature_a", "feature_b"],
 )
 ```
 
-Decision rule:
+Use:
 
-- start with runtime inputs
-- prefer `with_materializers(...)` when storage should be visible in the graph
-- use `materialize(...)` when execution-time flexibility matters more than graph permanence
+- runtime inputs for early prototyping and tests
+- static materializers when storage should be part of the graph
+- dynamic materialization when deployment code should choose sources/sinks at runtime
+
+### Adapters and result builders
+
+Adapters are the main extension point for runtime concerns:
+
+- result shaping
+- tracking
+- progress
+- hooks
+- integrations
+
+Common result builder:
+
+- `base.PandasDataFrameResult()` to collect requested outputs into a DataFrame
+
+Practical rule:
+
+- keep core transformations independent
+- attach runtime behavior with adapters rather than embedding it in node code
+
+---
+
+## 9. Caching And Parallelism {#caching-and-parallelism}
 
 ### Caching
 
-Enable caching with `Builder.with_cache()`.
+Hamilton supports builder-level and node-level caching behavior.
+
+Common behavior controls include:
+
+- `DEFAULT`
+- `RECOMPUTE`
+- `DISABLE`
+- `IGNORE`
+
+Typical setup:
 
 ```python
 dr = (
@@ -323,19 +424,39 @@ dr = (
 )
 ```
 
-Useful behaviors exposed by current docs include default caching plus explicit
-`recompute`, `disable`, and `ignore` controls.
+Important caveat:
 
-Decision rule:
+- cache invalidation does not automatically capture helper-function changes or dependency library changes
 
-- cache expensive, stable intermediate nodes
-- recompute changing external-source loaders
-- do not assume helper-function edits or library upgrades will always invalidate cached nodes correctly
+Practical rule:
 
-### Dynamic execution
+- recompute changing external-source nodes
+- avoid assuming the cache fully tracks hidden behavior
 
-Hamilton supports structural fan-out/fan-in execution using
-`Parallelizable[]` and `Collect[]`.
+### Parallelism
+
+Hamilton supports two distinct models.
+
+#### Adapter-based execution
+
+This uses an adapter/executor such as threadpool, Dask, Ray, or async-oriented execution.
+
+```python
+from hamilton.plugins.h_threadpool import FutureAdapter
+
+dr = (
+    driver.Builder()
+    .with_modules(foo_module)
+    .with_adapters(FutureAdapter())
+    .build()
+)
+```
+
+Use this first when you need execution parallelism without changing graph structure.
+
+#### Dynamic task-based execution
+
+This uses `Parallelizable[]` and `Collect[]`.
 
 ```python
 from hamilton.htypes import Collect, Parallelizable
@@ -347,8 +468,11 @@ def urls() -> Parallelizable[str]:
 def page_text(urls: str) -> str:
     return fetch(urls)
 
-def total_length(page_text: Collect[str]) -> int:
-    return sum(len(text) for text in page_text)
+def word_count(page_text: str) -> int:
+    return len(page_text.split())
+
+def total_words(word_count: Collect[int]) -> int:
+    return sum(word_count)
 ```
 
 ```python
@@ -360,122 +484,162 @@ dr = (
 )
 ```
 
-Decision rule:
+Use this only when the graph genuinely contains fan-out / fan-in structure.
 
-- use this only when the graph naturally contains repeated parallel branches
-- do not treat it as a generic speed toggle
-- re-check current docs for limitations before relying on it heavily
+### Async support
 
-### Visualization and validation
+Hamilton also provides an `AsyncDriver` for async-native runtimes. Use it when
+the surrounding environment is already async, not as a default.
 
-Visualization is part of the normal development loop, not just presentation.
-Use DAG display methods when the graph shape itself helps reasoning or review.
+---
 
-Validation decorators are worth using when data quality matters but you want to
-keep business logic separate from checks.
+## 10. Visualization, UI, And CLI {#visualization-ui-and-cli}
 
-```python
-from hamilton.function_modifiers import check_output
+### Visualization and graph inspection
 
-@check_output(importance="fail")
-def scored_df(features_df):
-    ...
+Visualization is a normal development tool in Hamilton, not just presentation.
+Use it to:
+
+- verify module composition
+- inspect the exact execution slice for requested outputs
+- debug unexpected dependencies
+- communicate lineage to humans
+
+### UI and observability
+
+Hamilton's UI/SDK stack covers execution telemetry, DAG views, lineage, and
+artifact / feature cataloging.
+
+Typical local startup:
+
+```bash
+pip install "sf-hamilton[ui,sdk]"
+hamilton ui
 ```
 
-Decision rule:
+Typical tracker wiring:
 
-- add validation where downstream analysis would be misleading without it
-- keep checks declarative rather than mixing assertions deep into transforms
+```python
+from hamilton_sdk.adapters import HamiltonTracker
 
----
+tracker = HamiltonTracker(
+    username="you@example.com",
+    project_id=1,
+    dag_name="marketing_features",
+)
+```
 
-## 7. Decorators That Change Behavior {#decorators}
+### CLI and pre-commit workflow
 
-The important nuance is that Hamilton decorators often change the graph at build
-time, not just runtime behavior.
-
-Useful categories:
-
-- `@config.when`, `@config.when_not`, `@config.when_in`: include/exclude node implementations by config
-- `@parameterize`: generate many nodes from one implementation
-- `@extract_columns` or `@extract_fields`: split a composite output into downstream-addressable nodes
-- `@load_from`, `@save_to`: inject explicit loader/saver behavior into the DAG
-- `@check_output`: validate outputs without mixing validation into business logic
-- `@tag`: attach metadata for filtering, ownership, lineage, or policy
-
-Practical interpretation:
-
-- inclusion decorators change which nodes exist
-- parameterization decorators expand one function into multiple nodes
-- I/O decorators inject graph edges around storage
-- validation decorators attach checks after the core node exists
-- metadata decorators help filtering and lineage but do not change computation
-
-This explains why Hamilton decorators feel stronger than ordinary Python decorators.
+Hamilton also supports CLI-oriented validation / inspection workflows. Treat
+CLI checks and DAG validation as part of CI/pre-commit hygiene once the graph
+matters to the team.
 
 ---
 
-## 8. Sharp Edges {#sharp-edges}
+## 11. Project Structure And Testing {#project-structure-and-testing}
 
-### Name collisions across modules
+Scalable layout:
 
-If two loaded modules define the same node name, `build()` fails unless you
-explicitly allow module overrides. This is useful for swapping variants, but
-it should be intentional.
+```text
+project/
+  dataflows/
+    sources.py
+    cleaning.py
+    features.py
+    training.py
+    outputs.py
+  run_local.py
+  run_batch.py
+  run_api.py
+  tests/
+    test_cleaning.py
+    test_features.py
+    test_training.py
+```
 
-If you really do want later modules to win, use the Builder option that allows
-module overrides rather than relying on accidental import order.
+Recommended conventions:
 
-### Runtime inputs can hide missing definitions
+- keep functions small and output-oriented
+- keep runtime-specific concerns out of DAG modules
+- group transformations by domain or stage
+- use module composition and `with_config()` for variability
+- introduce materializers only when the boundary is clear
 
-This is a feature, not a bug, but it can make the graph feel incomplete if you
-forget which dependencies are expected from `inputs=...`.
+Testing layers:
 
-### Caching does not notice every code change
-
-Caching is based on node code/version behavior, but hidden helper-function edits
-or external library changes may not invalidate the cached node the way you expect.
-
-### Decorators can reshape the graph
-
-If the graph looks surprising, check decorators before debugging execution.
-`@config.when`, `@parameterize`, `@load_from`, and extraction decorators often
-explain "missing" or "extra" nodes.
-
-### Dynamic execution is not ordinary parallelism
-
-Dynamic execution requires explicit enablement and specific graph structure.
-It is not the same thing as simply using a parallel executor.
-
-### Over-coupling I/O too early
-
-New teams often bake file paths, storage assumptions, or remote systems directly
-into node functions. Prefer pure transforms first, then add materializers or
-I/O decorators when the operational contract is clear.
-
-### Using Hamilton as the whole platform
-
-Hamilton should usually sit inside a broader system. Keep orchestration,
-scheduling, deployment, and environment management outside the transformation graph.
+- unit tests for plain transformation functions
+- DAG-level tests for a small driver plus toy inputs
+- validation / contract tests using `@check_output`, schemas, and graph validation
 
 ---
 
-## 9. When to Read Primary Docs {#when-to-read-primary-docs}
+## 12. Decision Rules {#decision-rules}
 
-Go to official docs or current source references when you need:
+Use Hamilton when:
 
-- exact install/version requirements
-- current extras for visualization, UI, Pandera, Pydantic, or SDK support
-- details of cache backends and cache-behavior configuration
-- the latest dynamic execution limitations
-- materializer/backend-specific syntax
-- exact CLI/UI commands
+- explicit intermediate artifacts matter
+- you want readable typed Python instead of hidden pipeline state
+- the same graph should run in notebooks, scripts, jobs, and services
+- lineage, explainability, or selective execution are valuable
 
-Useful primary-source topics:
+Stay with plain functions or thin scripts when:
 
-- Driver/Builder API
-- function modifiers and decorator categories
-- materialization and I/O
-- caching behavior
-- dynamic execution with `Parallelizable[]` / `Collect[]`
-- visualization and UI integrations
+- the pipeline is still tiny and graph reasoning adds little
+- the main problem is orchestration rather than computation design
+
+Prefer:
+
+- runtime inputs first
+- `with_config()` for implementation selection
+- materializers when I/O boundaries stabilize
+- validation once outputs become decision-relevant
+- caching after correctness is stable
+- parallelism only for concrete performance needs
+
+Adoption path:
+
+1. extract one existing script or notebook pipeline into one module
+2. keep loading as runtime inputs
+3. visualize the graph
+4. add tags and output validation
+5. split columns/fields where lineage matters
+6. add materializers when deployment needs settle
+7. enable cache selectively
+8. add tracker/UI only if operational visibility matters
+9. add parallelism only with a concrete reason
+
+---
+
+## 13. Common Mistakes {#common-mistakes}
+
+- writing huge nodes and losing lineage value
+- mixing too much I/O into business logic too early
+- ignoring node naming discipline
+- assuming cache invalidation notices every code change
+- treating Hamilton like a scheduler or full platform
+- forgetting that runtime inputs can satisfy otherwise "missing" dependencies
+- forgetting that many modifiers reshape the graph before execution
+
+---
+
+## 14. When To Read Primary Docs {#when-to-read-primary-docs}
+
+Go to current docs/source when you need:
+
+- exact extras, install, or integration requirements
+- backend-specific materializer syntax
+- current caching implementation details
+- current dynamic execution limitations
+- exact UI/CLI commands
+- framework-specific integration setup
+
+Primary topics worth revisiting:
+
+- Driver / Builder reference
+- function modifiers
+- materialization
+- caching
+- parallel task execution
+- AsyncDriver
+- UI / SDK integration
