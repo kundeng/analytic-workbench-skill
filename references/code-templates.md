@@ -1,45 +1,65 @@
 # Code Templates Reference
 
-Complete working examples for each component of the analytic workbench pattern.
+Complete working examples for each component of the analytic workbench.
 Copy and adapt these to bootstrap a new project.
 
 ## Table of Contents
 1. [Project Scaffold](#scaffold)
-2. [Hamilton-Compatible Module](#module)
-3. [marimo Exploration Notebook](#explore-notebook)
-4. [marimo Report App](#report-app)
-5. [Hydra Sweep Runner](#sweep-runner)
-6. [Comparison Table Builder](#comparison-builder)
-7. [Freshness-Aware Data Loader](#data-loader)
+2. [Hamilton Module (src/)](#module)
+3. [Hamilton Driver Entry Point](#driver-entry)
+4. [marimo Exploration Notebook](#explore-notebook)
+5. [marimo Report App](#report-app)
+6. [Hydra Sweep Runner](#sweep-runner)
+7. [Comparison Table Builder](#comparison-builder)
+8. [Freshness-Aware Data Loader](#data-loader)
+9. [requirements.txt](#requirements)
 
 ---
 
 ## 1. Project Scaffold {#scaffold}
 
 ```bash
-mkdir -p conf/experiment conf/source modules notebooks scripts outputs/runs data/raw data/processed
+mkdir -p src notebooks scripts tools conf/source conf/experiment rawdata runs
+touch src/__init__.py
 ```
 
-Minimal files to create:
+Then install dependencies:
+
+```bash
+pip install "sf-hamilton[visualization]" marimo hydra-core omegaconf \
+    polars duckdb pandas matplotlib --break-system-packages
+pip freeze > requirements.txt
 ```
-conf/config.yaml
-modules/__init__.py       # empty
-modules/baseline.py
-notebooks/explore.py      # marimo notebook
-scripts/run.py            # Hydra entry point
-scripts/build_comparison.py
+
+Create `.gitignore`:
+
+```
+rawdata/
+runs/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
 ```
 
 ---
 
-## 2. Hamilton-Compatible Module {#module}
+## 2. Hamilton Module (src/) {#module}
+
+Every module in `src/` follows Hamilton conventions: function name = output
+name, parameters = dependencies, type hints on everything.
 
 ```python
-# modules/baseline.py
-"""Time series construction from raw data. Hamilton-compatible conventions."""
+# src/baseline.py
+"""Time series construction from raw data."""
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
+
+
+def raw_data(raw_data_path: str) -> pd.DataFrame:
+    """Load raw data from CSV."""
+    return pd.read_csv(raw_data_path, parse_dates=True)
 
 
 def timeseries_hourly(
@@ -81,36 +101,74 @@ def timeseries_figure(
     ax.set_xlabel("Time")
     plt.tight_layout()
     return fig
+```
+
+Notice:
+
+- `raw_data` takes a path and returns a DataFrame — data loading is a DAG node.
+- `timeseries_hourly` depends on `raw_data` by parameter name.
+- `summary_stats` depends on `timeseries_hourly` by parameter name.
+- No I/O in core logic except the explicit `raw_data` loader.
+- Figures are returned as objects, not saved to disk inside the function.
+
+---
+
+## 3. Hamilton Driver Entry Point {#driver-entry}
+
+The Driver wires modules together and executes the DAG. This pattern works
+at every tier.
+
+```python
+# scripts/run_hamilton.py
+"""Standalone Hamilton execution — no Hydra, no marimo."""
+from hamilton import driver
+from pathlib import Path
+import json
+import src.baseline as baseline
 
 
-def save_baseline_artifacts(
-    timeseries_hourly: pd.Series,
-    timeseries_figure: "matplotlib.figure.Figure",
-    summary_stats: Dict[str, float],
-    output_dir: str,
-) -> Dict[str, str]:
-    """Save all baseline artifacts. Returns dict of file paths."""
-    import json
-    from pathlib import Path
-
+def run(params: dict, output_dir: str) -> dict:
+    """Execute Hamilton DAG and save artifacts."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "figures").mkdir(exist_ok=True)
+    (out / "data").mkdir(exist_ok=True)
 
-    ts_path = str(out / "timeseries.csv")
-    fig_path = str(out / "figures" / "fig-timeseries.png")
-    metrics_path = str(out / "metrics.json")
+    dr = (
+        driver.Builder()
+        .with_modules(baseline)
+        .build()
+    )
 
-    timeseries_hourly.to_csv(ts_path)
-    timeseries_figure.savefig(fig_path, dpi=150)
-    json.dump(summary_stats, open(metrics_path, "w"), indent=2)
+    results = dr.execute(
+        ["summary_stats", "timeseries_figure", "timeseries_hourly"],
+        inputs=params,
+    )
 
-    return {"timeseries": ts_path, "figure": fig_path, "metrics": metrics_path}
+    # Save artifacts
+    results["timeseries_hourly"].to_csv(out / "data" / "timeseries.csv")
+    results["timeseries_figure"].savefig(out / "figures" / "fig-timeseries.png", dpi=150)
+    json.dump(results["summary_stats"], open(out / "metrics.json", "w"), indent=2)
+    json.dump(params, open(out / "config.yaml", "w"), indent=2)
+
+    return results["summary_stats"]
+
+
+if __name__ == "__main__":
+    params = {
+        "raw_data_path": "rawdata/events.csv",
+        "date_column": "opened_at",
+        "resample_freq": "1h",
+    }
+    run(params, "runs/manual_001")
 ```
 
 ---
 
-## 3. marimo Exploration Notebook {#explore-notebook}
+## 4. marimo Exploration Notebook {#explore-notebook}
+
+The notebook is a thin UI shell. All computation goes through the Hamilton
+Driver.
 
 ```python
 # notebooks/explore.py
@@ -122,10 +180,9 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import marimo as mo
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-    return mo, pd, plt, Path
+    from hamilton import driver
+    import src.baseline as baseline
+    return mo, driver, baseline
 
 
 @app.cell
@@ -135,42 +192,57 @@ def _(mo):
 
 
 @app.cell
-def _(pd):
-    df = pd.read_csv("data/raw/events.csv", parse_dates=["timestamp"])
-    mo.md(f"**Loaded {len(df):,} rows** | "
-          f"Range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-    return df,
-
-
-@app.cell
 def _(mo):
     freq = mo.ui.dropdown(
         options=["10min", "30min", "1h", "4h", "1d"],
         value="1h",
         label="Resample frequency",
     )
-    freq
-    return freq,
+    data_path = mo.ui.text(
+        value="rawdata/events.csv",
+        label="Data path",
+    )
+    mo.hstack([freq, data_path])
+    return freq, data_path
 
 
 @app.cell
-def _(df, freq):
-    # Import from your Hamilton-compatible module
-    from modules.baseline import timeseries_hourly, summary_stats
-
-    ts = timeseries_hourly(df, date_column="timestamp", resample_freq=freq.value)
-    stats = summary_stats(ts)
-    stats
-    return ts, stats
+def _(driver, baseline):
+    dr = driver.Builder().with_modules(baseline).build()
+    return dr,
 
 
 @app.cell
-def _(ts, freq, plt):
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(ts.index, ts.values, linewidth=0.5)
-    ax.set_title(f"Event Count ({freq.value})")
-    plt.tight_layout()
-    fig
+def _(dr, freq, data_path):
+    results = dr.execute(
+        ["summary_stats", "timeseries_figure", "timeseries_hourly"],
+        inputs={
+            "raw_data_path": data_path.value,
+            "date_column": "opened_at",
+            "resample_freq": freq.value,
+        },
+    )
+    return results,
+
+
+@app.cell
+def _(results, mo):
+    stats = results["summary_stats"]
+    mo.md(f"**Total periods:** {stats['total_periods']:,} | "
+          f"**Mean:** {stats['mean']:.2f} | "
+          f"**Zero rate:** {stats['zero_rate']:.1%}")
+    return
+
+
+@app.cell
+def _(results):
+    results["timeseries_figure"]
+    return
+
+
+@app.cell
+def _(results):
+    results["timeseries_hourly"].tail(20)
     return
 
 
@@ -182,11 +254,13 @@ Run: `marimo edit notebooks/explore.py`
 
 ---
 
-## 4. marimo Report App {#report-app}
+## 5. marimo Report App {#report-app}
+
+Loads pre-computed artifacts from `runs/`. No computation, only display.
 
 ```python
 # notebooks/report.py
-"""Final review surface — loads artifacts, no computation."""
+"""Review surface — loads artifacts from runs/, no computation."""
 import marimo
 
 app = marimo.App(width="full")
@@ -209,10 +283,9 @@ def _(mo):
 
 @app.cell
 def _(pd, Path):
-    # Find all comparison tables
-    comp_files = sorted(Path("outputs").rglob("comparison.csv"))
-    if comp_files:
-        comparison = pd.read_csv(comp_files[-1])  # most recent
+    comp_path = Path("runs") / "comparison.csv"
+    if comp_path.exists():
+        comparison = pd.read_csv(comp_path)
     else:
         comparison = pd.DataFrame({"status": ["No comparison table found"]})
     comparison
@@ -232,21 +305,16 @@ def _(mo, comparison):
 
 @app.cell
 def _(run_selector, json, Path, mo):
-    # Find the run directory
-    candidates = list(Path("outputs").rglob(f"*{run_selector.value}*"))
-    run_dirs = [c for c in candidates if c.is_dir()]
-    if not run_dirs:
+    run_dir = Path("runs") / run_selector.value
+    if not run_dir.exists():
         mo.md("Run directory not found")
     else:
-        run_dir = run_dirs[0]
-        # Show metrics
         metrics_path = run_dir / "metrics.json"
         if metrics_path.exists():
             metrics = json.loads(metrics_path.read_text())
-            mo.md(f"### Metrics\n```json\n{json.dumps(metrics, indent=2)}\n```")
+            mo.tree(metrics)
 
-        # Show figures
-        figs = sorted(run_dir.rglob("*.png"))
+        figs = sorted((run_dir / "figures").glob("*.png"))
         if figs:
             mo.vstack([mo.image(src=str(f)) for f in figs])
     return
@@ -256,50 +324,55 @@ if __name__ == "__main__":
     app.run()
 ```
 
-Run: `marimo edit notebooks/report.py` or `marimo run notebooks/report.py`
+Run: `marimo run notebooks/report.py`
 
 ---
 
-## 5. Hydra Sweep Runner {#sweep-runner}
+## 6. Hydra Sweep Runner (Tier 2+) {#sweep-runner}
 
 ```python
 # scripts/run.py
-"""Hydra entry point for single runs and multirun sweeps."""
+"""Hydra entry point — composes config, then delegates to Hamilton Driver."""
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-import json
+from hamilton import driver
 from pathlib import Path
+import json
+import src.baseline as baseline
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> float:
-    import pandas as pd
-    from modules.baseline import (
-        timeseries_hourly,
-        summary_stats,
-        timeseries_figure,
-        save_baseline_artifacts,
+    out = Path(HydraConfig.get().runtime.output_dir)
+    (out / "figures").mkdir(parents=True, exist_ok=True)
+    (out / "data").mkdir(parents=True, exist_ok=True)
+
+    # Build Hamilton Driver
+    dr = (
+        driver.Builder()
+        .with_modules(baseline)
+        .build()
     )
 
-    # Hydra changes cwd to the output directory
-    out = Path(".")
+    # Flatten Hydra config to a dict Hamilton can consume as inputs
+    inputs = OmegaConf.to_container(cfg, resolve=True)
 
-    # Load data
-    df = pd.read_csv(cfg.source.path, parse_dates=[cfg.source.date_column])
+    # Execute only the outputs we need
+    results = dr.execute(
+        ["summary_stats", "timeseries_figure", "timeseries_hourly"],
+        inputs=inputs,
+    )
 
-    # Run analysis using Hamilton-compatible functions
-    ts = timeseries_hourly(df, cfg.source.date_column, cfg.baseline.resample_freq)
-    stats = summary_stats(ts)
-    fig = timeseries_figure(ts, cfg.baseline.resample_freq)
-
-    # Save artifacts
-    save_baseline_artifacts(ts, fig, stats, str(out))
-
-    # Save frozen config
+    # Save artifacts to run folder
+    results["timeseries_hourly"].to_csv(out / "data" / "timeseries.csv")
+    results["timeseries_figure"].savefig(
+        out / "figures" / "fig-timeseries.png", dpi=150
+    )
+    json.dump(results["summary_stats"], open(out / "metrics.json", "w"), indent=2)
     OmegaConf.save(cfg, out / "config.yaml")
 
-    # Return a metric for Hydra job results
-    return stats.get("total_count", 0)
+    return results["summary_stats"].get("total_count", 0)
 
 
 if __name__ == "__main__":
@@ -319,7 +392,7 @@ python scripts/run.py +experiment=fast_test
 
 ---
 
-## 6. Comparison Table Builder {#comparison-builder}
+## 7. Comparison Table Builder {#comparison-builder}
 
 ```python
 # scripts/build_comparison.py
@@ -331,30 +404,33 @@ from omegaconf import OmegaConf
 import sys
 
 
-def build_comparison(sweep_dir: str) -> pd.DataFrame:
+def build_comparison(runs_dir: str) -> pd.DataFrame:
     rows = []
-    for run_dir in sorted(Path(sweep_dir).iterdir()):
+    for run_dir in sorted(Path(runs_dir).iterdir()):
         if not run_dir.is_dir():
             continue
         metrics_path = run_dir / "metrics.json"
-        config_path = run_dir / "config.yaml"
         if not metrics_path.exists():
             continue
 
         metrics = json.loads(metrics_path.read_text())
         row = {"run_id": run_dir.name}
 
+        config_path = run_dir / "config.yaml"
         if config_path.exists():
-            cfg = OmegaConf.load(config_path)
-            # Extract key params — customize these for your project
-            row["resample_freq"] = OmegaConf.select(cfg, "baseline.resample_freq", default="")
-            # Add more params as needed
+            try:
+                cfg = OmegaConf.load(config_path)
+                row["resample_freq"] = OmegaConf.select(
+                    cfg, "baseline.resample_freq", default=""
+                )
+            except Exception:
+                pass
 
         row.update(metrics)
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    out_path = Path(sweep_dir) / "comparison.csv"
+    out_path = Path(runs_dir) / "comparison.csv"
     df.to_csv(out_path, index=False)
     print(f"Comparison table: {out_path} ({len(df)} runs)")
     return df
@@ -362,32 +438,36 @@ def build_comparison(sweep_dir: str) -> pd.DataFrame:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python scripts/build_comparison.py <sweep_dir>")
+        print("Usage: python scripts/build_comparison.py <runs_dir>")
         sys.exit(1)
     build_comparison(sys.argv[1])
 ```
 
 ---
 
-## 7. Freshness-Aware Data Loader {#data-loader}
+## 8. Freshness-Aware Data Loader {#data-loader}
+
+A Hamilton-compatible data loader with freshness tracking. Use this as a node
+in your DAG.
 
 ```python
-# modules/data_loader.py
+# src/data_loader.py
 """Load data with freshness-aware caching."""
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+import pandas as pd
+from typing import Callable
 
 
-def fetch_metadata_path(data_path: str) -> str:
+def _fetch_metadata_path(data_path: str) -> str:
     """Convention: metadata file sits next to the data file."""
     return str(Path(data_path).with_suffix(".meta.json"))
 
 
-def is_fresh(data_path: str, freshness_hours: int = 48) -> bool:
+def _is_fresh(data_path: str, freshness_hours: int = 48) -> bool:
     """Check if cached data is still fresh enough to reuse."""
-    meta_path = fetch_metadata_path(data_path)
+    meta_path = _fetch_metadata_path(data_path)
     if not Path(meta_path).exists() or not Path(data_path).exists():
         return False
     meta = json.loads(Path(meta_path).read_text())
@@ -395,7 +475,7 @@ def is_fresh(data_path: str, freshness_hours: int = 48) -> bool:
     return datetime.now(timezone.utc) - fetched < timedelta(hours=freshness_hours)
 
 
-def record_fetch(data_path: str, row_count: int, source: str = "") -> None:
+def _record_fetch(data_path: str, row_count: int, source: str = "") -> None:
     """Record when data was fetched for freshness tracking."""
     meta = {
         "source": source,
@@ -403,38 +483,60 @@ def record_fetch(data_path: str, row_count: int, source: str = "") -> None:
         "row_count": row_count,
         "data_path": data_path,
     }
-    Path(fetch_metadata_path(data_path)).write_text(json.dumps(meta, indent=2))
+    Path(_fetch_metadata_path(data_path)).write_text(json.dumps(meta, indent=2))
 
 
-def load_or_fetch(
-    data_path: str,
-    fetch_fn,
-    freshness_hours: int = 48,
-    source: str = "",
-):
-    """Load cached data if fresh, otherwise fetch and cache."""
-    import pandas as pd
+def raw_data_cached(
+    raw_data_path: str,
+    freshness_hours: int,
+    fetch_source: str,
+) -> pd.DataFrame:
+    """Load cached data if fresh, otherwise signal that a fetch is needed.
 
-    if is_fresh(data_path, freshness_hours):
-        print(f"Using cached data: {data_path}")
-        return pd.read_csv(data_path)
+    In practice, the fetch function is project-specific. Override this node
+    or inject the fetch callable through Hamilton inputs.
+    """
+    if _is_fresh(raw_data_path, freshness_hours):
+        return pd.read_csv(raw_data_path)
 
-    print(f"Fetching fresh data -> {data_path}")
-    df = fetch_fn()
-    Path(data_path).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(data_path, index=False)
-    record_fetch(data_path, len(df), source)
-    return df
+    raise FileNotFoundError(
+        f"Data at {raw_data_path} is stale or missing. "
+        f"Run the appropriate fetch tool first: "
+        f"python tools/fetch_data.py --output {raw_data_path}"
+    )
 ```
 
-Usage:
-```python
-from modules.data_loader import load_or_fetch
+Note: helper functions prefixed with `_` are ignored by Hamilton's graph
+discovery. Only `raw_data_cached` becomes a DAG node.
 
-df = load_or_fetch(
-    "data/raw/incidents.csv",
-    fetch_fn=lambda: my_splunk_extract(),
-    freshness_hours=48,
-    source="splunk:index=snow",
-)
+---
+
+## 9. requirements.txt {#requirements}
+
+Baseline for all projects:
+
+```
+sf-hamilton[visualization]
+marimo
+hydra-core
+omegaconf
+polars
+duckdb
+pandas
+matplotlib
+```
+
+Add as needed:
+
+```
+# Heavy analytics
+stumpy
+statsmodels
+scikit-learn
+
+# Tier 2+ tracking
+sf-hamilton[ui,sdk]
+
+# Tier 3 persistence
+dvc[s3]
 ```

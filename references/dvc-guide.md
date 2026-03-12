@@ -4,6 +4,7 @@ Use this reference once the workbench has grown into explicit cached stages and
 reproducible multi-run comparisons.
 
 DVC is the persistence layer for:
+
 - stage DAG execution
 - file-level caching and reuse
 - parameter tracking
@@ -16,7 +17,7 @@ Do not treat it as the whole workflow. The workflow is defined by
 ## Setup
 
 ```bash
-uv pip install "dvc[s3]"
+pip install "dvc[s3]" --break-system-packages
 dvc init
 ```
 
@@ -28,24 +29,24 @@ DVC-tracked outputs or ignored folders.
 ```yaml
 stages:
   extract:
-    cmd: python scripts/01_extract.py
+    cmd: python tools/fetch_data.py --output rawdata/incidents.csv
     deps:
-      - scripts/01_extract.py
+      - tools/fetch_data.py
     params:
       - source
     outs:
-      - data/raw/
+      - rawdata/incidents.csv
 
   baseline:
-    cmd: python scripts/02_baseline.py
+    cmd: python scripts/run.py baseline.resample_freq=${baseline.resample_freq}
     deps:
-      - scripts/02_baseline.py
-      - data/raw/
+      - scripts/run.py
+      - src/baseline.py
+      - rawdata/incidents.csv
     params:
-      - baseline
+      - baseline.resample_freq
     outs:
-      - data/processed/baseline/
-      - outputs/figures/baseline/
+      - runs/baseline/
 ```
 
 Track tunable values in `params.yaml`, not inline shell constants.
@@ -61,6 +62,7 @@ dvc dag
 ```
 
 Interpretation:
+
 - `dvc status` shows stale stages.
 - `dvc repro` runs stale stages in DAG order.
 - `dvc repro STAGE` runs a target stage and its upstream dependencies.
@@ -82,7 +84,8 @@ dvc exp apply EXP_NAME
 ```
 
 Good practice:
-- still write explicit per-run artifacts
+
+- still write explicit per-run artifacts to `runs/`
 - still build a comparison table
 - use `dvc exp show` as a helper, not the only source of comparison truth
 
@@ -113,6 +116,7 @@ recovered later.
 ## When to Add DVC
 
 Add DVC when at least one of these becomes painful without it:
+
 - expensive upstream data pulls
 - repeat runs with mostly unchanged inputs
 - disciplined comparison across many runs

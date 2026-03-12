@@ -11,10 +11,10 @@
 
 ## 1. Per-Run Artifact Folders {#per-run-folders}
 
-Every experiment run produces a self-contained folder:
+Every experiment run produces a self-contained folder under `runs/`:
 
 ```
-outputs/runs/<run-id>/
+runs/<run-id>/
   config.yaml           # frozen config — exactly what params produced this run
   metrics.json          # machine-readable summary metrics
   figures/
@@ -30,19 +30,28 @@ outputs/runs/<run-id>/
 ```
 
 **Run ID conventions:**
+
 - Timestamp: `2026-03-08_14-22-33` (default from Hydra)
 - Override-based: `resample_freq=1h,window_size=24` (Hydra sweep subdirs)
 - Named: `experiment_fast_test_001` (manual runs)
 
 **Non-negotiable files:**
+
 - `config.yaml` — without this, the run is not reproducible.
 - `metrics.json` — without this, the run cannot be compared.
+
+**Key layout rules:**
+
+- All run artifacts live inside `runs/<run-id>/`. No separate `outputs/figures/`
+  or `data/processed/` directories at the project root.
+- `rawdata/` holds immutable source data. It is never written to by a run.
+- Each run folder is self-contained and independently meaningful.
 
 ---
 
 ## 2. Comparison Table Schema {#comparison-table}
 
-The comparison table (`outputs/comparison.csv`) is a first-class artifact.
+The comparison table (`runs/comparison.csv`) is a first-class artifact.
 One row per run. Columns:
 
 | Column | Source | Purpose |
@@ -63,12 +72,12 @@ run_id,resample_freq,window_size,threshold,total_incidents,discords_found,precis
 ```
 
 This table answers:
+
 - Under which settings does the method perform best?
 - What is the tradeoff between sensitivity and false positives?
 - Which parameter has the most impact on results?
 
-**Build it automatically** after every sweep with `scripts/build_comparison.py`
-(see `hydra-config.md`).
+**Build it automatically** after every sweep with `scripts/build_comparison.py`.
 
 ---
 
@@ -80,12 +89,12 @@ to reuse cached data vs. re-fetch.
 **Example rule:** "Do not pull SNOW incident data from Splunk again within 48
 hours because results won't materially change."
 
-### Implementation without DVC
+### Implementation
 
-Track freshness with a simple metadata file:
+Track freshness with a metadata file next to the data:
 
 ```json
-// data/raw/.fetch_metadata.json
+// rawdata/incidents.meta.json
 {
   "source": "splunk",
   "query": "index=* sourcetype=snow:incident",
@@ -95,34 +104,21 @@ Track freshness with a simple metadata file:
 }
 ```
 
-Check before fetching:
+The `src/data_loader.py` module (see `code-templates.md`) uses `_is_fresh()`
+helper functions prefixed with `_` so they stay out of the Hamilton DAG while
+the public `raw_data_cached` node participates in the graph.
 
-```python
-from datetime import datetime, timezone, timedelta
-import json
-from pathlib import Path
-
-def should_refetch(metadata_path: str, freshness_hours: int = 48) -> bool:
-    path = Path(metadata_path)
-    if not path.exists():
-        return True
-    meta = json.loads(path.read_text())
-    fetched = datetime.fromisoformat(meta["fetched_at"])
-    return datetime.now(timezone.utc) - fetched > timedelta(hours=freshness_hours)
-```
-
-### Implementation with DVC
+### DVC freshness (Tier 3)
 
 DVC handles this natively with frozen stages:
 
 ```yaml
-# dvc.yaml
 stages:
   extract:
-    frozen: true           # won't re-run unless manually unfrozen
-    cmd: python tools/splunk_search.py --output data/raw/incidents.csv
+    frozen: true
+    cmd: python tools/fetch_data.py --output rawdata/incidents.csv
     outs:
-      - data/raw/incidents.csv
+      - rawdata/incidents.csv
 ```
 
 Unfreeze when you want fresh data: `dvc repro --force extract`
@@ -131,7 +127,7 @@ Unfreeze when you want fresh data: `dvc repro --force extract`
 
 ## 4. DVC Integration Patterns {#dvc-integration}
 
-When to add DVC (Phase 4 of the maturity path):
+When to add DVC (Tier 3):
 
 ### Stage caching
 
@@ -142,32 +138,16 @@ stages:
     cmd: >-
       python scripts/run.py
         baseline.resample_freq=${baseline.resample_freq}
-        output.dir=data/processed/baseline
     deps:
-      - data/raw/incidents.csv
-      - modules/baseline.py
+      - rawdata/incidents.csv
+      - src/baseline.py
     params:
       - baseline.resample_freq
     outs:
-      - data/processed/baseline/
+      - runs/baseline/
 ```
 
 DVC skips the stage if inputs, code, and params haven't changed.
-
-### Experiment tracking
-
-```bash
-# Run experiments with DVC
-dvc exp run -S baseline.resample_freq=30min
-dvc exp run -S baseline.resample_freq=1h
-dvc exp run -S analysis.anomaly_threshold=2.5
-
-# Compare
-dvc exp show --sort-by metrics.precision --sort-order desc
-
-# Apply best
-dvc exp apply <exp-name>
-```
 
 ### When DVC and Hydra overlap
 
@@ -191,28 +171,32 @@ They coexist well. Hydra manages the config; DVC manages the artifacts.
 After every run, the AI should programmatically check:
 
 ### Data validation
-- [ ] Row counts are plausible (not 0, not absurdly large)
-- [ ] No unexpected NaN or Inf values in key columns
-- [ ] Date ranges cover the expected window
-- [ ] Categorical values match expected sets (e.g., priority in {1,2,3,4})
+
+- Row counts are plausible (not 0, not absurdly large)
+- No unexpected NaN or Inf values in key columns
+- Date ranges cover the expected window
+- Categorical values match expected sets
 
 ### Metrics validation
-- [ ] All metrics in `metrics.json` are finite numbers
-- [ ] Precision, recall, F1 are in [0, 1]
-- [ ] Counts are non-negative integers
-- [ ] Results change meaningfully across parameter settings (not all identical)
+
+- All metrics in `metrics.json` are finite numbers
+- Precision, recall, F1 are in [0, 1]
+- Counts are non-negative integers
+- Results change meaningfully across parameter settings (not all identical)
 
 ### Figure validation (via vision)
-- [ ] Figures are non-trivial (not blank, not all-zero)
-- [ ] Axes are labeled and readable
-- [ ] Time series cover the expected date range
-- [ ] Anomaly markers (if any) are visible
+
+- Figures are non-trivial (not blank, not all-zero)
+- Axes are labeled and readable
+- Time series cover the expected date range
+- Anomaly markers (if any) are visible
 
 ### Cross-run validation
-- [ ] Comparison table has one row per run
-- [ ] No duplicate run IDs
-- [ ] Metrics vary across runs (if all identical, something is wrong)
-- [ ] Best config is identified and noted
+
+- Comparison table has one row per run
+- No duplicate run IDs
+- Metrics vary across runs (if all identical, something is wrong)
+- Best config is identified and noted
 
 **Report findings to the human** along with the comparison table and key figures.
-The human reviews the same artifacts, presented interactively in marimo.
+The human reviews the same artifacts in the marimo report app.

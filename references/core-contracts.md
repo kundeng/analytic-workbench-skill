@@ -30,6 +30,7 @@ Every pipeline stage has a state. The agent respects transitions.
 ```
 
 **Rules:**
+
 - Never update a report/narrative with results from an unapproved stage.
 - Always self-review before presenting to the human.
 - Always write manifest.json after execution.
@@ -52,13 +53,13 @@ Written by agent after every stage execution.
     "baseline.resample_freq": "1h"
   },
   "inputs": {
-    "data/raw/incidents.csv": "sha256:abc123..."
+    "rawdata/incidents.csv": "sha256:abc123..."
   },
   "outputs": {
-    "data/processed/baseline/timeseries.csv": "sha256:def456...",
-    "data/processed/baseline/summary.json": "sha256:789abc..."
+    "runs/2026-03-08T1422Z/data/timeseries.csv": "sha256:def456...",
+    "runs/2026-03-08T1422Z/metrics.json": "sha256:789abc..."
   },
-  "code_ref": "scripts/02_baseline.py@git:a1b2c3d",
+  "code_ref": "src/baseline.py@git:a1b2c3d",
   "duration_seconds": 12.4
 }
 ```
@@ -123,6 +124,7 @@ Written by agent when human approves (verbally or in writing).
 ```
 
 When the human edits the AI's interpretation:
+
 - `interpretation_edited: true`
 - `approved_interpretation` contains the human's version
 - The narrative/report uses `approved_interpretation`, not the AI's draft
@@ -163,8 +165,8 @@ draft interpretation. The human approves or edits both.
 ## Artifacts
 - 8,760 hourly periods covering 2025-03-08 to 2026-03-08
 - Mean: 1.4 incidents/hour, Max: 28, Zero-hour rate: 12%
-- Files: timeseries.csv, summary.json
-- Figures: fig-timeseries.png, fig-by-priority.png
+- Files: runs/2026-03-08T1422Z/data/timeseries.csv
+- Figures: runs/2026-03-08T1422Z/figures/fig-timeseries.png
 
 ## AI Self-review
 All checks passed. No warnings.
@@ -184,14 +186,14 @@ Edit the interpretation above if the framing needs adjustment.
 ## Workflow: Step by Step (Tier 3)
 
 ```
-1. Check pipeline state (dvc status)
-2. Run stale stages (dvc repro)
+1. Check pipeline state (dvc status or run status)
+2. Run stale stages (Hamilton Driver via scripts/run.py)
 3. For each completed stage:
-   a. Write review/STAGE/manifest.json
+   a. Write review/<stage>/manifest.json
    b. Run self-review checks
-   c. Write review/STAGE/review.json
+   c. Write review/<stage>/review.json
    d. Draft AI interpretation
-   e. Write review/STAGE/card.md
+   e. Write review/<stage>/card.md
    f. Present card to human
 4. Human decides:
    - Approved → write approval.json, update narrative
@@ -205,9 +207,10 @@ Edit the interpretation above if the framing needs adjustment.
 ## Data Access: CLI Tools in `tools/`
 
 Every data-access tool must:
-- Accept `--output PATH` for file output
+
+- Accept `--output PATH` for file output (typically to `rawdata/`)
 - Accept `--format csv|json`
-- Read credentials from `.env` (never CLI args or params.yaml)
+- Read credentials from `.env` (never CLI args or config files)
 - Print progress to stderr
 - Exit non-zero on failure
-- Be independently runnable: `python tools/my_tool.py --help`
+- Be independently runnable: `python tools/fetch_data.py --help`

@@ -1,17 +1,46 @@
 # marimo Patterns Reference
 
+marimo is the **frontend layer** of the analytic workbench. It owns display,
+interactivity, and layout. It never contains business logic — that belongs in
+Hamilton modules under `src/`.
+
 ## Table of Contents
-1. [Notebook Structure](#notebook-structure)
-2. [Reactive Cells](#reactive-cells)
-3. [UI Elements for Parameter Tuning](#ui-elements)
-4. [Script Mode & CLI Arguments](#script-mode)
-5. [App Mode for Reports](#app-mode)
-6. [Integration with Analysis Modules](#module-integration)
-7. [Displaying Artifacts](#displaying-artifacts)
+1. [Philosophy: marimo as Frontend](#philosophy)
+2. [Notebook Structure](#notebook-structure)
+3. [Interactive Exploration (Tier 1+)](#interactive-exploration)
+4. [Report App (Tier 2+)](#report-app)
+5. [UI Elements for Parameter Tuning](#ui-elements)
+6. [State and Stateful Interactions](#state)
+7. [Script Mode and CLI Arguments](#script-mode)
+8. [App Deployment](#app-deployment)
+9. [Anti-Patterns](#anti-patterns)
 
 ---
 
-## 1. Notebook Structure {#notebook-structure}
+## 1. Philosophy: marimo as Frontend {#philosophy}
+
+The rule is simple: **marimo displays, Hamilton computes.**
+
+A marimo notebook should:
+
+- Create a Hamilton `Driver` from `src/` modules
+- Gather parameters from UI widgets
+- Call `dr.execute(outputs, inputs=params)` to get results
+- Display those results (figures, tables, metrics, markdown)
+
+A marimo notebook should never:
+
+- Contain `df.groupby(...)`, `ts.rolling(...)`, or any transform logic
+- Read raw data directly (`pd.read_csv` in a notebook cell)
+- Compute metrics or statistics inline
+- Define functions that belong in `src/`
+
+If you find yourself writing more than 3 lines of non-display code in a cell,
+that code belongs in a `src/` module.
+
+---
+
+## 2. Notebook Structure {#notebook-structure}
 
 marimo notebooks are pure Python files. Each cell is a function decorated with
 `@app.cell`. Variables defined in one cell are automatically available to cells
@@ -24,46 +53,24 @@ import marimo
 
 app = marimo.App(width="medium")
 
+
 @app.cell
 def _():
     import marimo as mo
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    return mo, pd, plt
+    from hamilton import driver
+    import src.baseline as baseline
+    import src.features as features
+    return mo, driver, baseline, features
+
 
 @app.cell
 def _(mo):
-    mo.md("# Exploratory Analysis")
+    mo.md("# Interactive Exploration")
     return
-
-@app.cell
-def _(pd):
-    df = pd.read_csv("data/raw/incidents.csv", parse_dates=["opened_at"])
-    df
-    return df,
-
-@app.cell
-def _(df, mo):
-    freq_slider = mo.ui.dropdown(
-        options=["10min", "30min", "1h", "4h"],
-        value="1h",
-        label="Resample frequency"
-    )
-    freq_slider
-    return freq_slider,
-
-@app.cell
-def _(df, freq_slider, plt):
-    ts = df.set_index("opened_at").resample(freq_slider.value).size()
-    fig, ax = plt.subplots(figsize=(14, 4))
-    ax.plot(ts.index, ts.values, linewidth=0.5)
-    ax.set_title(f"Incident Count ({freq_slider.value} bins)")
-    plt.tight_layout()
-    fig
-    return ts,
 ```
 
 **Key rules:**
+
 - Each cell is a function. The last expression is displayed.
 - Return variables you want other cells to see (note the trailing comma).
 - Imports go in their own cell and are returned.
@@ -71,35 +78,155 @@ def _(df, freq_slider, plt):
 
 ---
 
-## 2. Reactive Cells {#reactive-cells}
+## 3. Interactive Exploration (Tier 1+) {#interactive-exploration}
 
-When a UI element changes (slider, dropdown, checkbox), marimo automatically
-re-executes every cell that depends on that element's `.value`. This is the
-core advantage over Jupyter — no manual re-run, no stale state.
+This is the primary pattern. The notebook creates a Hamilton Driver, gathers
+parameters from widgets, executes the DAG, and displays results.
 
 ```python
 @app.cell
 def _(mo):
+    freq = mo.ui.dropdown(
+        options=["10min", "30min", "1h", "4h", "1d"],
+        value="1h",
+        label="Resample frequency",
+    )
     window = mo.ui.slider(12, 336, value=24, step=12, label="Window size (hours)")
     threshold = mo.ui.number(1.0, 10.0, value=3.0, step=0.5, label="Anomaly threshold")
-    mo.hstack([window, threshold])
-    return window, threshold
+    mo.hstack([freq, window, threshold])
+    return freq, window, threshold
+
 
 @app.cell
-def _(ts, window, threshold):
-    import stumpy
-    mp = stumpy.stump(ts.values, m=window.value)
-    anomalies = mp[:, 0] > threshold.value
-    f"Found {anomalies.sum()} anomalies with window={window.value}h, threshold={threshold.value}"
-    return mp, anomalies
+def _(driver, baseline, features):
+    # Build the Driver once — modules don't change during a session
+    dr = (
+        driver.Builder()
+        .with_modules(baseline, features)
+        .build()
+    )
+    return dr,
+
+
+@app.cell
+def _(dr, freq, window, threshold):
+    # Execute the DAG with widget values as inputs
+    results = dr.execute(
+        ["summary_stats", "timeseries_figure", "discords"],
+        inputs={
+            "raw_data_path": "rawdata/events.csv",
+            "resample_freq": freq.value,
+            "window_size": window.value,
+            "anomaly_threshold": threshold.value,
+        },
+    )
+    return results,
+
+
+@app.cell
+def _(results):
+    # Display the figure — Hamilton node returned a matplotlib Figure
+    results["timeseries_figure"]
+    return
+
+
+@app.cell
+def _(results, mo):
+    # Display metrics
+    stats = results["summary_stats"]
+    mo.md(f"**Total periods:** {stats['total_periods']:,} | "
+          f"**Mean:** {stats['mean']:.2f} | "
+          f"**Zero rate:** {stats['zero_rate']:.1%}")
+    return
+
+
+@app.cell
+def _(results):
+    # Display discords table — interactive by default in marimo
+    results["discords"]
+    return
 ```
 
-Move the slider → the matrix profile recomputes → the anomaly count updates.
-No callbacks, no event handlers, no `on_change`.
+Move a slider → `results` recomputes → all downstream cells update. No
+callbacks, no event handlers. The computation happens inside Hamilton, not in
+the notebook.
 
 ---
 
-## 3. UI Elements for Parameter Tuning {#ui-elements}
+## 4. Report App (Tier 2+) {#report-app}
+
+The report app loads pre-computed artifacts from `runs/`. It does **no
+computation** — only display and navigation.
+
+```python
+# notebooks/report.py
+import marimo
+
+app = marimo.App(width="full")
+
+
+@app.cell
+def _():
+    import marimo as mo
+    import pandas as pd
+    import json
+    from pathlib import Path
+    return mo, pd, json, Path
+
+
+@app.cell
+def _(mo):
+    mo.md("# Experiment Comparison Report")
+    return
+
+
+@app.cell
+def _(pd, Path):
+    # Load comparison table
+    comp_path = Path("runs") / "comparison.csv"
+    if comp_path.exists():
+        comparison = pd.read_csv(comp_path)
+    else:
+        comparison = pd.DataFrame({"status": ["No comparison table found"]})
+    comparison
+    return comparison,
+
+
+@app.cell
+def _(mo, comparison):
+    if "run_id" in comparison.columns:
+        run_selector = mo.ui.dropdown(
+            options=comparison["run_id"].tolist(),
+            label="Inspect run",
+        )
+        run_selector
+    return run_selector,
+
+
+@app.cell
+def _(run_selector, json, Path, mo):
+    run_dir = Path("runs") / run_selector.value
+    if not run_dir.exists():
+        mo.md("Run directory not found")
+    else:
+        # Show metrics
+        metrics_path = run_dir / "metrics.json"
+        if metrics_path.exists():
+            metrics = json.loads(metrics_path.read_text())
+            mo.tree(metrics)
+
+        # Show figures
+        figs = sorted((run_dir / "figures").glob("*.png"))
+        if figs:
+            mo.vstack([mo.image(src=str(f)) for f in figs])
+    return
+```
+
+Run as app: `marimo run notebooks/report.py`
+
+---
+
+## 5. UI Elements for Parameter Tuning {#ui-elements}
 
 Common elements for analytic workbenches:
 
@@ -121,25 +248,60 @@ mo.ui.multiselect(
 )
 
 # Text input
-mo.ui.text(value="data/raw/incidents.csv", label="Input path")
+mo.ui.text(value="rawdata/events.csv", label="Input path")
 
 # Layout
 mo.hstack([slider, dropdown, checkbox])  # horizontal
 mo.vstack([chart1, chart2])              # vertical
 mo.tabs({"Overview": tab1, "Details": tab2})  # tabbed
+mo.accordion({"Section A": content_a})   # collapsible
 ```
 
 ---
 
-## 4. Script Mode & CLI Arguments {#script-mode}
+## 6. State and Stateful Interactions {#state}
+
+For interactions that need to persist across reactive updates (selections,
+accumulated results, user annotations), use `mo.state()`:
+
+```python
+@app.cell
+def _(mo):
+    get_selected, set_selected = mo.state([])
+    return get_selected, set_selected
+
+
+@app.cell
+def _(mo, comparison, set_selected):
+    # Table with row selection
+    table = mo.ui.table(
+        comparison,
+        selection="multi",
+        on_change=lambda rows: set_selected(rows),
+    )
+    table
+    return table,
+
+
+@app.cell
+def _(get_selected, mo):
+    selected = get_selected()
+    if selected:
+        mo.md(f"**{len(selected)} runs selected** for detailed comparison")
+    return selected,
+```
+
+Use `mo.state()` sparingly — most interactions work through reactive widget
+values without explicit state.
+
+---
+
+## 7. Script Mode and CLI Arguments {#script-mode}
 
 Run a marimo notebook as a script (no browser, no interactivity):
 
 ```bash
-# Execute and capture output
 marimo run notebooks/explore.py
-
-# With CLI arguments (overrides mo.cli_args())
 marimo run notebooks/explore.py -- --freq 1h --window 72
 ```
 
@@ -159,102 +321,37 @@ batch execution (CLI, Hydra sweep runner).
 
 ---
 
-## 5. App Mode for Reports {#app-mode}
+## 8. App Deployment {#app-deployment}
 
-Build a final review surface as a marimo app:
+marimo notebooks can be deployed as standalone web apps:
 
-```python
-# notebooks/report.py — loads artifacts, no computation
-import marimo
-app = marimo.App(width="full")
+```bash
+# Local app server
+marimo run notebooks/report.py --host 0.0.0.0 --port 8080
 
-@app.cell
-def _():
-    import marimo as mo
-    import pandas as pd
-    import json
-    from pathlib import Path
-    return mo, pd, json, Path
-
-@app.cell
-def _(mo):
-    mo.md("# Experiment Comparison Report")
-    return
-
-@app.cell
-def _(pd):
-    comparison = pd.read_csv("outputs/comparison.csv")
-    comparison
-    return comparison,
-
-@app.cell
-def _(mo, comparison):
-    run_selector = mo.ui.dropdown(
-        options=comparison["run_id"].tolist(),
-        label="Select run to inspect"
-    )
-    run_selector
-    return run_selector,
-
-@app.cell
-def _(run_selector, json, Path):
-    run_dir = Path(f"outputs/runs/{run_selector.value}")
-    metrics = json.loads((run_dir / "metrics.json").read_text())
-    metrics
-    return run_dir, metrics
-
-@app.cell
-def _(mo, run_dir):
-    # Display figures from the selected run
-    figs = sorted(run_dir.glob("figures/*.png"))
-    mo.vstack([mo.image(src=str(f)) for f in figs])
-    return
+# Hide code, show only outputs
+marimo run notebooks/report.py --include-code false
 ```
 
-The human opens this app, browses runs via dropdown, sees comparison table and
-per-run figures. Same artifacts the AI already reviewed programmatically.
+For the workbench, the report app is the primary deployment target. It reads
+from `runs/` and presents the comparison table, per-run drill-down, and
+figures. The human reviews here; the AI reviews programmatically.
 
 ---
 
-## 6. Integration with Analysis Modules {#module-integration}
+## 9. Anti-Patterns {#anti-patterns}
 
-marimo notebooks import and call functions from Hamilton-compatible modules:
+**Computation in cells.** If a cell contains pandas transforms, statistical
+calculations, or model fitting, move that code to a `src/` module and call
+it through the Hamilton Driver.
 
-```python
-@app.cell
-def _(df, freq_slider):
-    from modules.baseline import incidents_hourly, incidents_by_priority
+**Direct data loading.** `pd.read_csv("rawdata/...")` in a notebook cell
+bypasses Hamilton's dependency tracking. Instead, create a Hamilton node that
+loads data and request it through the Driver.
 
-    ts = incidents_hourly(df, resample_freq=freq_slider.value)
-    ts_by_priority = incidents_by_priority(df, resample_freq=freq_slider.value)
-    return ts, ts_by_priority
-```
+**Fat notebooks.** If your notebook has more than ~15 cells, it's doing too
+much. Split into separate notebooks (explore, report) or move logic to `src/`.
 
-The modules contain the reusable logic. The notebook is the interactive harness.
-When the AI edits a module function, marimo picks up the change on next run.
-
----
-
-## 7. Displaying Artifacts {#displaying-artifacts}
-
-```python
-# DataFrames — displayed as interactive tables automatically
-df.head(20)
-
-# Matplotlib figures — last expression displayed
-fig, ax = plt.subplots()
-ax.plot(ts)
-fig
-
-# Markdown
-mo.md(f"**Total incidents:** {len(df):,}")
-
-# Images from disk
-mo.image(src="outputs/figures/anomalies.png")
-
-# JSON/dict — displayed as collapsible tree
-metrics_dict
-
-# Side-by-side comparison
-mo.hstack([chart_a, chart_b])
-```
+**Mixing explore and report.** The exploration notebook creates a Driver and
+runs live computation. The report notebook loads pre-computed artifacts. Don't
+combine these — they serve different purposes and different audiences.
