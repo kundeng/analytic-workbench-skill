@@ -89,9 +89,25 @@ python scripts/run.py source=splunk
 
 Key composition rules:
 
-- group selections like `source: splunk` land under `cfg.source`
+- `defaults:` is composition metadata, not business data you usually read from `cfg`
+- `_self_` means "merge the body of the current file here"
+- order matters: later merges win on conflicts
+- group selections like `source: splunk` usually land under `cfg.source`
 - `# @package _global_` changes placement so the file merges at the config root
 
+Minimal precedence example:
+
+```yaml
+defaults:
+  - source: csv_local
+  - _self_
+
+source:
+  timeout: 30
+```
+
+In this case, the current file merges after `source: csv_local`, so `source.timeout: 30`
+from the current file overrides the same field from `csv_local.yaml`.
 ---
 
 ## 3. Experiment Configs {#experiment-configs}
@@ -150,18 +166,21 @@ python scripts/run.py baseline.resample_freq=30min analysis.anomaly_threshold=2.
 
 Operator semantics:
 
-- `key=value` — set an existing key; errors if path does not exist
-- `+key=value` — add a new key only if currently absent; errors if already present
-- `++key=value` — create or replace; use carefully (can hide typos)
-- `~key` — delete a key or remove a defaults-list selection
+- `key=value`: set an existing key; usually errors if the path does not exist
+- `+key=value`: add a new key only if it is currently absent; errors if already present
+- `++key=value`: create or replace; use carefully because it can hide typos
+- `~key`: delete a key or remove a defaults-list selection
 
 Two different kinds of override:
 
-- `source=splunk` selects a config-group option (Hydra loads a different file)
-- `source.timeout=60` changes a field inside the already selected `source`
+- `source=splunk` selects a config-group option, meaning Hydra loads a different config file
+- `source.timeout=60` changes a field inside the already selected `source` subtree
 
-Practical rule: use plain `key=value` by default, `+` when "must be new" is
-the point, `++` only for explicit create-or-replace.
+Practical rule:
+
+- use plain `key=value` by default
+- use `+` when "must be new" is the point
+- use `++` only when you explicitly want create-or-replace behavior
 
 ---
 

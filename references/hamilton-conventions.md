@@ -5,22 +5,51 @@ DAG of transformations. All business logic lives in `src/` modules as Hamilton
 functions. The Driver executes them.
 
 ## Table of Contents
-1. [Mental Model](#mental-model)
-2. [Install and Extras](#install-and-extras)
-3. [Canonical Pattern](#canonical-pattern)
-4. [Driver and Builder](#driver-and-builder)
-5. [How Hamilton Builds the DAG](#how-hamilton-builds-the-dag)
-6. [Function Modifiers That Matter](#function-modifiers-that-matter)
-7. [Materialization and Adapters](#materialization-and-adapters)
-8. [Caching and Parallelism](#caching-and-parallelism)
-9. [Visualization and Debugging](#visualization-and-debugging)
-10. [Project Conventions for This Workbench](#project-conventions)
-11. [Common Mistakes](#common-mistakes)
-12. [When to Read Primary Docs](#when-to-read-primary-docs)
+1. [What It Is](#what-it-is)
+2. [Mental Model](#mental-model)
+3. [Install And Extras](#install-and-extras)
+4. [Canonical Pattern](#canonical-pattern)
+5. [Driver And Builder](#driver-and-builder)
+6. [How Hamilton Builds The DAG](#how-hamilton-builds-the-dag)
+7. [Function Modifiers That Matter](#function-modifiers-that-matter)
+8. [Materialization And Adapters](#materialization-and-adapters)
+9. [Caching And Parallelism](#caching-and-parallelism)
+10. [Visualization, UI, And CLI](#visualization-ui-and-cli)
+11. [Project Structure And Testing](#project-structure-and-testing)
+12. [Decision Rules](#decision-rules)
+13. [Common Mistakes](#common-mistakes)
+14. [When To Read Primary Docs](#when-to-read-primary-docs)
 
 ---
 
-## 1. Mental Model {#mental-model}
+## 1. What It Is {#what-it-is}
+
+Hamilton is a Python dataflow framework where:
+
+- a function becomes a node
+- parameter names define dependencies
+- type hints define expected contracts
+- the runtime builds and executes the DAG automatically
+
+It is best understood as the transformation/computation layer inside a larger
+system. Keep scheduling, infrastructure orchestration, and deployment concerns
+outside Hamilton.
+
+Good fit:
+
+- analytics, data, ML, and LLM workflows with meaningful intermediate artifacts
+- codebases that need lineage, selective execution, validation, and portability
+- teams willing to use naming discipline and many small functions
+
+Bad fit:
+
+- workflows dominated by opaque large steps
+- teams mainly looking for scheduling or cluster management
+- low-code / visual-only pipeline authoring preferences
+
+---
+
+## 2. Mental Model {#mental-model}
 
 Hamilton's authoring model is intentionally small:
 
@@ -55,7 +84,7 @@ That separation is why Hamilton remains readable.
 
 ---
 
-## 2. Install and Extras {#install-and-extras}
+## 3. Install And Extras {#install-and-extras}
 
 The package name is `sf-hamilton`.
 
@@ -73,7 +102,7 @@ Notes:
 
 ---
 
-## 3. Canonical Pattern {#canonical-pattern}
+## 4. Canonical Pattern {#canonical-pattern}
 
 ### Transformation module
 
@@ -132,7 +161,7 @@ What this shows:
 
 ---
 
-## 4. Driver and Builder {#driver-and-builder}
+## 5. Driver And Builder {#driver-and-builder}
 
 ### `Driver`
 
@@ -193,7 +222,7 @@ Do not conflate these two.
 
 ---
 
-## 5. How Hamilton Builds the DAG {#how-hamilton-builds-the-dag}
+## 6. How Hamilton Builds The DAG {#how-hamilton-builds-the-dag}
 
 At a high level Hamilton:
 
@@ -212,10 +241,11 @@ This explains three important properties:
 
 ---
 
-## 6. Function Modifiers That Matter {#function-modifiers-that-matter}
+## 7. Function Modifiers That Matter {#function-modifiers-that-matter}
 
-Function modifiers are central to Hamilton. They can change inclusion, expand
-nodes, split outputs, inject I/O, add validation, or attach metadata.
+Function modifiers are central to Hamilton. They do more than ordinary Python
+decorators: they can change inclusion, expand nodes, split outputs, inject I/O,
+add validation, or attach metadata.
 
 ### `@tag`
 
@@ -295,6 +325,10 @@ from hamilton.function_modifiers import load_from, save_to, source
 @load_from.csv(path=source("raw_input_path"))
 def cleaned_data(raw_data: pd.DataFrame) -> pd.DataFrame:
     return raw_data.dropna()
+
+@save_to.parquet(path=source("output_path"), output_name_="cleaned_data_written")
+def cleaned_data_for_save(cleaned_data):
+    return cleaned_data
 ```
 
 Practical interpretation:
@@ -304,41 +338,81 @@ Practical interpretation:
 - extraction exposes column/field lineage
 - I/O decorators inject storage edges
 - validation decorators attach checks after computation
-- metadata decorators help governance and filtering
+- metadata decorators help governance and filtering without changing computation
 
 ---
 
-## 7. Materialization and Adapters {#materialization-and-adapters}
+## 8. Materialization And Adapters {#materialization-and-adapters}
 
 ### Materialization
 
-Two styles:
+There are two main styles:
 
 - static materializers attached at build time via `with_materializers(...)`
 - dynamic materializers passed to `Driver.materialize(...)`
 
-Use runtime inputs for early prototyping, static materializers when storage is
-part of the graph, dynamic materialization when deployment code chooses
-sources/sinks at runtime.
+Dynamic materialization example:
+
+```python
+from hamilton import base, driver
+from hamilton.io.materialization import from_, to
+import pipeline
+
+dr = driver.Builder().with_modules(pipeline).build()
+
+metadata, outputs = dr.materialize(
+    from_.csv(target="raw_df", path="./input.csv"),
+    to.csv(
+        id="feature_export",
+        dependencies=["feature_a", "feature_b"],
+        path="./out/features.csv",
+        combine=base.PandasDataFrameResult(),
+    ),
+    additional_vars=["feature_a", "feature_b"],
+)
+```
+
+Use:
+
+- runtime inputs for early prototyping and tests
+- static materializers when storage should be part of the graph
+- dynamic materialization when deployment code should choose sources/sinks at runtime
 
 ### Adapters and result builders
 
-Adapters are the main extension point for runtime concerns: result shaping,
-tracking, progress, hooks, integrations.
+Adapters are the main extension point for runtime concerns:
 
-Common result builder: `base.PandasDataFrameResult()` to collect requested
-outputs into a DataFrame.
+- result shaping
+- tracking
+- progress
+- hooks
+- integrations
 
-Practical rule: keep core transformations independent, attach runtime behavior
-with adapters rather than embedding it in node code.
+Common result builder:
+
+- `base.PandasDataFrameResult()` to collect requested outputs into a DataFrame
+
+Practical rule:
+
+- keep core transformations independent
+- attach runtime behavior with adapters rather than embedding it in node code
 
 ---
 
-## 8. Caching and Parallelism {#caching-and-parallelism}
+## 9. Caching And Parallelism {#caching-and-parallelism}
 
 ### Caching
 
-Hamilton supports builder-level and node-level caching.
+Hamilton supports builder-level and node-level caching behavior.
+
+Common behavior controls include:
+
+- `DEFAULT`
+- `RECOMPUTE`
+- `DISABLE`
+- `IGNORE`
+
+Typical setup:
 
 ```python
 dr = (
@@ -349,15 +423,22 @@ dr = (
 )
 ```
 
-Important caveat: cache invalidation does not automatically capture
-helper-function changes or dependency library changes.
+Important caveat:
+
+- cache invalidation does not automatically capture helper-function changes or dependency library changes
+
+Practical rule:
+
+- recompute changing external-source nodes
+- avoid assuming the cache fully tracks hidden behavior
 
 ### Parallelism
 
-Two models:
+Hamilton supports two distinct models.
 
-**Adapter-based execution** — uses a threadpool, Dask, Ray, or async executor
-without changing graph structure.
+#### Adapter-based execution
+
+This uses an adapter/executor such as threadpool, Dask, Ray, or async-oriented execution.
 
 ```python
 from hamilton.plugins.h_threadpool import FutureAdapter
@@ -370,8 +451,11 @@ dr = (
 )
 ```
 
-**Dynamic task-based execution** — uses `Parallelizable[]` and `Collect[]`
-for fan-out/fan-in patterns.
+Use this first when you need execution parallelism without changing graph structure.
+
+#### Dynamic task-based execution
+
+This uses `Parallelizable[]` and `Collect[]`.
 
 ```python
 from hamilton.htypes import Collect, Parallelizable
@@ -383,38 +467,99 @@ def urls() -> Parallelizable[str]:
 def page_text(urls: str) -> str:
     return fetch(urls)
 
-def total_words(page_text: Collect[int]) -> int:
-    return sum(page_text)
+def word_count(page_text: str) -> int:
+    return len(page_text.split())
+
+def total_words(word_count: Collect[int]) -> int:
+    return sum(word_count)
 ```
 
-Use parallelism only for concrete performance needs, not as a default.
+```python
+dr = (
+    driver.Builder()
+    .with_modules(webflow)
+    .enable_dynamic_execution(allow_experimental_mode=True)
+    .build()
+)
+```
+
+Use this only when the graph genuinely contains fan-out / fan-in structure.
+
+### Async support
+
+Hamilton also provides an `AsyncDriver` for async-native runtimes. Use it when
+the surrounding environment is already async, not as a default.
 
 ---
 
-## 9. Visualization and Debugging {#visualization-and-debugging}
+## 10. Visualization, UI, And CLI {#visualization-ui-and-cli}
+
+### Visualization and graph inspection
 
 Visualization is a normal development tool in Hamilton, not just presentation.
-Use it to verify module composition, inspect execution slices, debug unexpected
-dependencies, and communicate lineage to humans.
+Use it to:
 
-```python
-# In a marimo notebook or script
-dr.display_all_functions()  # show full graph
-dr.visualize_execution(["output_name"], inputs=inputs)  # show execution slice
-```
+- verify module composition
+- inspect the exact execution slice for requested outputs
+- debug unexpected dependencies
+- communicate lineage to humans
 
-Hamilton UI for operational visibility:
+### UI and observability
+
+Hamilton's UI/SDK stack covers execution telemetry, DAG views, lineage, and
+artifact / feature cataloging.
+
+Typical local startup:
 
 ```bash
 pip install "sf-hamilton[ui,sdk]" --break-system-packages
 hamilton ui
 ```
 
+Typical tracker wiring:
+
+```python
+from hamilton_sdk.adapters import HamiltonTracker
+
+tracker = HamiltonTracker(
+    username="you@example.com",
+    project_id=1,
+    dag_name="marketing_features",
+)
+```
+
+### CLI and pre-commit workflow
+
+Hamilton also supports CLI-oriented validation / inspection workflows. Treat
+CLI checks and DAG validation as part of CI/pre-commit hygiene once the graph
+matters to the team.
+
 ---
 
-## 10. Project Conventions for This Workbench {#project-conventions}
+## 11. Project Structure And Testing {#project-structure-and-testing}
 
-All Hamilton modules live in `src/`. Layout:
+### Base scalable layout
+
+```text
+project/
+  dataflows/
+    sources.py
+    cleaning.py
+    features.py
+    training.py
+    outputs.py
+  run_local.py
+  run_batch.py
+  run_api.py
+  tests/
+    test_cleaning.py
+    test_features.py
+    test_training.py
+```
+
+### Workbench-specific layout
+
+All Hamilton modules for this workbench live in `src/`. Layout:
 
 ```
 src/
@@ -426,12 +571,15 @@ src/
   data_loader.py       # freshness-aware data loading
 ```
 
-Conventions:
+### Conventions
+
+Recommended conventions:
 
 - keep functions small and output-oriented
-- keep runtime-specific concerns out of `src/` modules
+- keep runtime-specific concerns out of DAG modules
 - group transformations by domain or stage
-- use `with_config()` and `@config.when` for implementation variability
+- use module composition and `with_config()` for variability
+- introduce materializers only when the boundary is clear
 - helper functions prefixed with `_` stay out of the DAG
 - data loading is a DAG node (e.g., `raw_data(raw_data_path: str) -> pd.DataFrame`)
 - figures are returned as objects, never saved inside a node
@@ -440,25 +588,62 @@ Testing layers:
 
 - unit tests for plain transformation functions
 - DAG-level tests for a small driver plus toy inputs
-- validation / contract tests using `@check_output`
+- validation / contract tests using `@check_output`, schemas, and graph validation
 
 ---
 
-## 11. Common Mistakes {#common-mistakes}
+## 12. Decision Rules {#decision-rules}
+
+Use Hamilton when:
+
+- explicit intermediate artifacts matter
+- you want readable typed Python instead of hidden pipeline state
+- the same graph should run in notebooks, scripts, jobs, and services
+- lineage, explainability, or selective execution are valuable
+
+Stay with plain functions or thin scripts when:
+
+- the pipeline is still tiny and graph reasoning adds little
+- the main problem is orchestration rather than computation design
+
+Prefer:
+
+- runtime inputs first
+- `with_config()` for implementation selection
+- materializers when I/O boundaries stabilize
+- validation once outputs become decision-relevant
+- caching after correctness is stable
+- parallelism only for concrete performance needs
+
+Adoption path:
+
+1. extract one existing script or notebook pipeline into one module
+2. keep loading as runtime inputs
+3. visualize the graph
+4. add tags and output validation
+5. split columns/fields where lineage matters
+6. add materializers when deployment needs settle
+7. enable cache selectively
+8. add tracker/UI only if operational visibility matters
+9. add parallelism only with a concrete reason
+
+---
+
+## 13. Common Mistakes {#common-mistakes}
 
 - writing huge nodes and losing lineage value
-- mixing I/O into business logic too early
+- mixing too much I/O into business logic too early
 - ignoring node naming discipline
 - assuming cache invalidation notices every code change
 - treating Hamilton like a scheduler or full platform
-- forgetting that runtime inputs can satisfy "missing" dependencies
-- forgetting that modifiers reshape the graph before execution
+- forgetting that runtime inputs can satisfy otherwise "missing" dependencies
+- forgetting that many modifiers reshape the graph before execution
 - confusing Hydra config (parameter values) with Hamilton `with_config()` (node selection)
 - putting transform logic in marimo cells instead of `src/` modules
 
 ---
 
-## 12. When to Read Primary Docs {#when-to-read-primary-docs}
+## 14. When To Read Primary Docs {#when-to-read-primary-docs}
 
 Go to current docs/source when you need:
 
@@ -468,3 +653,13 @@ Go to current docs/source when you need:
 - current dynamic execution limitations
 - exact UI/CLI commands
 - framework-specific integration setup
+
+Primary topics worth revisiting:
+
+- Driver / Builder reference
+- function modifiers
+- materialization
+- caching
+- parallel task execution
+- AsyncDriver
+- UI / SDK integration

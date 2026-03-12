@@ -11,31 +11,33 @@ edits interpretations, and decides what to try next.
 
 ---
 
-## Architecture: Hydra → Hamilton → marimo
+## Recommended Architecture: Config → Computation → Display
 
-Three layers, one direction. Each layer has a single job.
+The workbench separates three concerns. Each layer has a single job.
 
 ```
-Hydra (config)  →  Hamilton (computation)  →  marimo (display)
-  what to run        how to run it              what the human sees
+Config layer   →  Computation layer  →  Display layer
+  what to run       how to run it        what the human sees
 ```
 
-**Hydra** resolves config composition, CLI overrides, and sweep parameters. It
-produces a frozen `DictConfig` and hands it off. It never touches DataFrames or
-figures.
+**Recommended tools** (not required — the methodology matters more than the
+specific tools):
 
-**Hamilton** takes that config (via `Builder().with_config(...)` and
-`driver.execute(..., inputs=...)`) and runs the DAG. It produces typed
-intermediate artifacts — Series, DataFrames, floats, figures. It never renders
-UI or reads YAML files.
+- **Config**: Hydra (config composition, CLI overrides, sweeps). Alternatives:
+  plain YAML, argparse, or any config system that produces a dict.
+- **Computation**: Hamilton (DAG of typed functions, selective execution).
+  Alternatives: plain Python modules following Hamilton conventions, or any
+  framework that keeps logic in small testable functions.
+- **Display**: marimo (reactive notebooks, app mode). Alternatives: Jupyter,
+  Streamlit, or any surface that separates display from business logic.
 
-**marimo** is a thin reactive shell. It either calls the Hamilton driver
-directly (interactive mode) or loads pre-computed artifacts from `runs/`
-(report mode). It owns sliders, dropdowns, layout, tabs. It never contains
-business logic.
+The principle is layered separation: config never touches DataFrames,
+computation never renders UI, display never contains business logic. The
+specific tools are recommendations that work well together, but the skill
+works with substitutes that respect the same boundaries.
 
-At Tier 1, Hydra is absent — widget values serve as config. The Hamilton
-convention and marimo-as-frontend rule still apply.
+At Tier 1, the config layer may just be widget values or function arguments.
+The separation of computation from display still applies.
 
 ---
 
@@ -135,10 +137,10 @@ the directory structure and Hamilton conventions are the same at every tier.
 
 | Tier | When | Config | Computation | Display |
 |------|------|--------|-------------|---------|
-| **1: Notebook** | Small, exploratory | marimo widget values | Hamilton-convention modules in `src/`, called via Driver | marimo notebook |
-| **2: Workbench** | Repeatable experiments, comparison | Hydra configs + sweeps | Hamilton Driver with `with_config()` | marimo app + comparison tables |
-| **3: Reproducible** | Expensive data, many runs, ML | Hydra + DVC params | Hamilton + DVC cached stages | marimo for review |
-| **4: Orchestrated** | Production, team, CI/CD | Orchestrator config + Hydra | dagster assets or prefect flows wrapping Hamilton | Orchestrator UI + marimo |
+| **1: Notebook** | Small, exploratory | Widget values or function args | Modules in `src/` following Hamilton conventions | Reactive notebook (marimo preferred) |
+| **2: Workbench** | Repeatable experiments, comparison | Hydra configs + sweeps (or equivalent) | Hamilton Driver (or Hamilton-convention modules) | marimo app + comparison tables |
+| **3: Reproducible** | Expensive data, many runs, ML | Hydra + DVC params (or equivalent) | Hamilton + DVC cached stages | Notebook/app for review |
+| **4: Orchestrated** | Production, team, CI/CD | Orchestrator config + Hydra | dagster assets, prefect flows, or Hamilton | Orchestrator UI + notebook |
 
 **Start at Tier 1 only for truly lightweight work. Most comparison-driven
 analyses should begin at Tier 2.** Signs you need the next tier:
@@ -162,8 +164,8 @@ analyses should begin at Tier 2.** Signs you need the next tier:
 
 ## Tier 1: Disciplined Exploration
 
-Even at Tier 1, code lives in `src/` as Hamilton-convention functions. The
-marimo notebook is a thin UI shell.
+Even at Tier 1, prefer to keep computation code in `src/` as small, typed
+functions. The notebook is primarily a display and interaction surface.
 
 ### What "Hamilton convention" means at Tier 1
 
@@ -174,27 +176,29 @@ Write Python modules as collections of small, typed functions where:
 - type hints = the contract
 - no side effects in core logic
 
-You can call these directly or (better) through a Hamilton `Driver`. Either way,
-the code is ready for Tier 2 with zero changes.
+You can call these directly, through a Hamilton `Driver`, or import them into
+notebook cells. The goal is that the code is ready for Tier 2 with minimal
+changes.
 
 ### Tier 1 flow
 
 ```
-marimo notebook
-  ├── UI widgets (sliders, dropdowns) → config dict
-  ├── Hamilton Driver from src/ modules
-  ├── dr.execute(["output_name"], inputs=config)
+notebook
+  ├── UI widgets (sliders, dropdowns) → parameters
+  ├── Import from src/ modules (or use Hamilton Driver)
+  ├── Call functions / dr.execute(["output_name"], inputs=params)
   └── Display results (figures, tables, metrics)
 ```
 
-The notebook never contains `df.groupby(...)` or `ts.rolling(...)`. That logic
-lives in `src/`.
+Prefer to keep transform logic (groupby, rolling, model fitting) in `src/`
+modules. Small exploratory calculations in notebook cells are acceptable during
+early exploration — move them to `src/` once they stabilize.
 
 ---
 
-## Tier 2: Hydra → Hamilton → marimo
+## Tier 2: Config → Computation → Display
 
-### Config layer (Hydra)
+### Config layer (Hydra recommended)
 
 Hydra composes config from YAML files and CLI overrides. It produces a frozen
 `DictConfig`.
@@ -214,7 +218,7 @@ analysis:
   anomaly_threshold: 3.0
 ```
 
-### Computation layer (Hamilton)
+### Computation layer (Hamilton recommended)
 
 The runner script builds a Hamilton Driver with Hydra config and executes:
 
@@ -252,15 +256,15 @@ Note: Hydra produces the config dict. Hamilton consumes it as `inputs`. Hamilton
 own `with_config()` is used for node selection (`@config.when`), not for passing
 parameter values.
 
-### Display layer (marimo)
+### Display layer (marimo recommended)
 
 Two modes:
 
-**Interactive exploration** — marimo creates its own Driver, passes widget
-values as inputs, displays results live.
+**Interactive exploration** — the notebook creates its own Driver (or imports
+functions directly), passes widget values as inputs, displays results live.
 
-**Report/review** — marimo loads pre-computed artifacts from `runs/`, provides
-dropdowns to browse runs, displays comparison tables and figures.
+**Report/review** — the notebook loads pre-computed artifacts from `runs/`,
+provides dropdowns to browse runs, displays comparison tables and figures.
 
 See `references/marimo-patterns.md` for detailed patterns.
 
@@ -327,10 +331,10 @@ At **Tier 3+**: write `approval.json`. Never update a report with unapproved res
 
 | Action | How |
 |--------|-----|
-| Edit analysis logic | Modify small functions in `src/`. Hamilton style isolates concerns. |
-| Run quick exploration | Execute marimo notebook — it calls Hamilton Driver with widget inputs. |
-| Create artifacts | Hamilton nodes produce figures/data. Save functions write to `runs/`. |
-| Add derived outputs | New function in `src/` module. Import module in Driver. No ceremony. |
+| Edit analysis logic | Modify small functions in `src/`. Hamilton-style isolation keeps blast radius low. |
+| Run quick exploration | Execute notebook — it calls `src/` functions or Hamilton Driver with widget inputs. |
+| Create artifacts | Functions produce figures/data. Save routines write to `runs/`. |
+| Add derived outputs | New function in `src/` module. Import in notebook or Driver. No ceremony. |
 | Compare runs | Read per-run `metrics.json`, build DataFrame, save `comparison.csv`. |
 | Build reports | marimo app loading artifacts: comparison table + per-run drill-down. |
 | Run sweeps | Hydra config + `--multirun`. Each run saves to `runs/<run-id>/`. |
